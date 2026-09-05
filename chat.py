@@ -1,0 +1,250 @@
+import sys
+import shutil
+import subprocess
+
+from pipeline import answer
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
+
+def main():
+    if len(sys.argv) > 1:
+        question = " ".join(sys.argv[1:])
+        record = answer(question)
+        print("\n" + "=" * 60)
+        _print_retrieved_chunks(record)
+        print(record["answer"])
+        _print_metrics(record)
+        return
+
+    print("Ask questions about your PDFs. Type 'exit' or Ctrl+C to quit.\n")
+    while True:
+        try:
+            question = input("Q: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not question:
+            continue
+        if question.lower() in {"exit", "quit", "q"}:
+            break
+
+        record = answer(question)
+        print()
+        _print_retrieved_chunks(record)
+        print("A:", record["answer"])
+        _print_metrics(record)
+        print()
+
+
+def _print_retrieved_chunks(record):
+    chunks = record.get("retrieved_chunks", [])
+    if not chunks:
+        print("Retrieved chunks: none (this question used the direct LLM route)")
+        return
+
+    print("Retrieved chunks:")
+    for chunk in chunks:
+        section = f", section: {chunk['section']}" if chunk.get("section") else ""
+        print(
+            f"  - [{chunk['id']}] {chunk['source']} p.{chunk['page']}"
+            f"{section} (score={chunk['score']:.3f})"
+        )
+
+
+def _print_metrics(record):
+    print(
+        "\n[Total input tokens: {input_tokens} | Total output tokens: {output_tokens} | "
+        "Total cost: ${cost:.6f} | Total LLM latency: {latency:.2f}s]".format(
+            input_tokens=record.get("total_input_tokens", record["input_tokens"]),
+            output_tokens=record.get("total_output_tokens", record["output_tokens"]),
+            cost=record.get("total_cost", record["cost"]),
+            latency=record.get("total_latency_seconds", record["latency_seconds"]),
+        )
+    )
+    print("LLM path: " + " -> ".join(record.get("executed_path", [])))
+    for call in record.get("llm_calls", []):
+        print(
+            f"  {call['stage']}: input={call['input_tokens']} "
+            f"output={call['output_tokens']} cost=${call['cost']:.6f} "
+            f"latency={call['latency_seconds']:.2f}s "
+            f"model={call['model']}"
+        )
+    print(
+        "Evaluation: "
+        f"Context Relevance={record.get('context_relevance')} | "
+        f"Faithfulness={record.get('faithfulness')} | "
+        f"Answer Relevance={record.get('answer_relevance')} | "
+        f"Correctness={record.get('correctness')}"
+    )
+    if record.get("judge_notes"):
+        print(f"Evaluation notes: {record['judge_notes']}")
+
+
+def _run_streamlit_app():
+    import streamlit as st
+
+    st.set_page_config(
+        page_title="Document Assistant",
+        page_icon="📚",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    st.markdown(
+        """
+        <style>
+        .stApp { background: #f5f7f4; }
+        [data-testid="stHeader"] { background: rgba(245, 247, 244, 0.9); }
+        .hero {
+            padding: 2.6rem 0 1.5rem;
+            border-bottom: 1px solid #dbe2dc;
+            margin-bottom: 1.8rem;
+        }
+        .eyebrow {
+            color: #39715d;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 0.55rem;
+        }
+        .hero h1 { color: #18352c; margin: 0; font-size: 2.45rem; }
+        .hero p { color: #64736c; font-size: 1.05rem; margin: 0.65rem 0 0; }
+        .answer-box {
+            background: #ffffff;
+            border: 1px solid #dbe2dc;
+            border-left: 4px solid #39715d;
+            border-radius: 8px;
+            padding: 1.35rem 1.5rem;
+            color: #20322b;
+            line-height: 1.85;
+            white-space: pre-wrap;
+        }
+        .source-card {
+            background: #ffffff;
+            border: 1px solid #dbe2dc;
+            border-radius: 8px;
+            padding: 0.9rem 1rem;
+            margin: 0.55rem 0;
+        }
+        div.stButton > button[kind="primary"] {
+            background: #39715d;
+            border-color: #39715d;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="eyebrow">Local document intelligence</div>
+            <h1>Ask your documents</h1>
+            <p>Search the indexed PDFs and get a grounded answer with traceable sources.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown("### Session details")
+        st.caption("Answers are generated locally through your configured LM Studio server.")
+        show_details = st.toggle("Show retrieval details", value=True)
+        show_metrics = st.toggle("Show performance metrics", value=False)
+        st.divider()
+        st.caption("Use the indexed PDF content as the source of truth. The assistant will say when the context is insufficient.")
+
+    question = st.text_area(
+        "Your question",
+        placeholder="Ask a question about the indexed PDFs...",
+        height=120,
+        label_visibility="visible",
+    )
+    ask = st.button("Ask the assistant", type="primary", use_container_width=False)
+
+    if ask:
+        if not question.strip():
+            st.warning("Please enter a question first.")
+            return
+
+        with st.spinner("Searching the documents and preparing an answer..."):
+            try:
+                record = answer(question.strip(), verbose=False)
+            except Exception as exc:
+                st.error(f"The assistant could not answer this question: {exc}")
+                return
+
+        st.session_state["last_record"] = record
+
+    record = st.session_state.get("last_record")
+    if not record:
+        st.info("Enter a question above to begin.")
+        return
+
+    st.markdown("### Answer")
+    st.markdown(
+        f'<div class="answer-box">{record["answer"]}</div>',
+        unsafe_allow_html=True,
+    )
+
+    chunks = record.get("retrieved_chunks", [])
+    if chunks:
+        st.markdown("### Sources")
+        st.caption(f"{len(chunks)} document passage(s) used to form this answer")
+        for index, chunk in enumerate(chunks, start=1):
+            section = f" | {chunk['section']}" if chunk.get("section") else ""
+            title = f"{index}. {chunk['source']} · page {chunk['page']}{section}"
+            with st.expander(title):
+                st.caption(f"Chunk ID: {chunk['id']} · retrieval score: {chunk['score']:.3f}")
+                st.write(chunk.get("text", "Passage text is unavailable for this result."))
+    else:
+        st.caption("This answer used the direct assistant route and did not retrieve a document passage.")
+
+    if show_details:
+        with st.expander("Route and retrieval details"):
+            st.write(f"**Route:** `{record.get('route', record.get('approach', 'unknown'))}`")
+            st.write(f"**Why:** {record.get('router_reason', 'Not provided')}")
+            techniques = record.get("techniques_used", [])
+            st.write(f"**Techniques:** {', '.join(techniques) if techniques else 'None'}")
+            path = record.get("executed_path", [])
+            st.write(f"**LLM path:** {' → '.join(path) if path else 'None'}")
+
+    if show_metrics:
+        st.markdown("### Performance")
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Input tokens", record.get("total_input_tokens", record.get("input_tokens", 0)))
+        metric_columns[1].metric("Output tokens", record.get("total_output_tokens", record.get("output_tokens", 0)))
+        metric_columns[2].metric("Latency", f"{record.get('total_latency_seconds', record.get('latency_seconds', 0)):.2f}s")
+        metric_columns[3].metric("Cost", f"${record.get('total_cost', record.get('cost', 0)):.6f}")
+
+        st.caption(
+            "Evaluation: "
+            f"Context relevance {record.get('context_relevance')} · "
+            f"Faithfulness {record.get('faithfulness')} · "
+            f"Answer relevance {record.get('answer_relevance')} · "
+            f"Correctness {record.get('correctness')}"
+        )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        main()
+    else:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+        except ImportError:
+            main()
+        else:
+            if get_script_run_ctx() is not None:
+                _run_streamlit_app()
+            else:
+                streamlit_command = shutil.which("streamlit")
+                if streamlit_command is None:
+                    main()
+                else:
+                    subprocess.run([sys.executable, "-m", "streamlit", "run", __file__], check=False)
