@@ -90,6 +90,28 @@ LM_STUDIO_MODEL = "jais-family-2p7b-chat"  # main answer-generation model
 # the values below to match exactly.
 # LM_STUDIO_MODEL = "qwen2.5-3b-instruct"      # alternate generation model
 # LM_STUDIO_MODEL = "qwen2.5-7b-instruct"      # heavier generation model
+
+# --- Ollama (used for router + judge, since only Jais is loaded in LM
+# Studio and LM Studio only serves one loaded model at a time) ---
+# Ollama exposes the same OpenAI-compatible /v1/chat/completions shape LM
+# Studio does, just on its own port, so it can run alongside LM Studio
+# without the two fighting over the same model slot. Install Ollama, run
+# `ollama pull qwen2.5:3b` and `ollama pull qwen2.5:7b` (Ollama serves
+# Qwen2.5 directly -- no separate GGUF hunting needed), and `ollama serve`
+# should already be running in the background after install (it installs
+# as a background service on most platforms; run it manually if not).
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
+# Maps each model name to the server that actually hosts it.
+# generation.call_completion() looks a model up here to decide which
+# server to call; any model NOT listed here falls back to
+# LM_STUDIO_BASE_URL, so this only needs entries for models living
+# somewhere other than the default LM Studio server.
+MODEL_BASE_URLS = {
+    "qwen2.5:3b": OLLAMA_BASE_URL,
+    "qwen2.5:7b": OLLAMA_BASE_URL,
+}
+
 MAX_NEW_TOKENS = 800
 TEMPERATURE = 0.2
 
@@ -107,21 +129,18 @@ BASIC_RAG_LOG = os.path.join(LOGS_DIR, "basic_rag_runs.jsonl")
 EVAL_LOG = os.path.join(LOGS_DIR, "eval_runs.jsonl")
 
 # --- LLM-as-judge evaluation ---
-# Which model answers the judge prompts. Keep this independent from the
-# generation model to avoid using the same LLM for both answer generation
-# and evaluation. If you do not have a separate judge model loaded in LM
-# Studio, set this to the same model name temporarily; otherwise point it at
-# a stronger model you have available.
-JUDGE_MODEL = "qwen2.5-7b-instruct"
+# Which model answers the judge prompts. Runs on Ollama (see
+# MODEL_BASE_URLS above) so it's independent from both the generation
+# model (Jais, on LM Studio) and doesn't need a second model loaded
+# alongside Jais in LM Studio's single model slot.
+JUDGE_MODEL = "qwen2.5:7b"
 JUDGE_MAX_NEW_TOKENS = 400
 JUDGE_TEMPERATURE = 0.0  # deterministic scoring, not creative generation
 
 # --- Router ---
 # Classifies each incoming question into a route BEFORE any retrieval
-# happens. Keep this independent from the generation model so routing is
-# not tied to the same model used to draft final answers. If you only have
-# one local model loaded, set this to that model name temporarily.
-ROUTER_MODEL = "qwen2.5-3b-instruct"
+# happens. Also runs on Ollama, for the same reason as JUDGE_MODEL above.
+ROUTER_MODEL = "qwen2.5:3b"
 ROUTER_MAX_NEW_TOKENS = 300
 ROUTER_TEMPERATURE = 0.0
 VALID_ROUTES = {"simple_llm_direct", "rag", "advanced_rag"}

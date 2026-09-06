@@ -59,13 +59,29 @@ def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
     })
 
 
+def _base_url_for(model: str) -> str:
+    """
+    Which server hosts this model. Different local-model servers (LM
+    Studio, Ollama, ...) can each host a different subset of the three
+    roles (generation/router/judge) -- this is what lets the router and
+    judge run on Ollama (serving Qwen) while generation stays on LM
+    Studio (serving Jais), without every call site needing to know or
+    care which backend a given model actually lives on.
+    Falls back to LM Studio's URL for any model not explicitly mapped,
+    which keeps this backward-compatible with a single-server setup.
+    """
+    return config.MODEL_BASE_URLS.get(model, config.LM_STUDIO_BASE_URL)
+
+
 def call_completion(messages: list, max_tokens: int, temperature: float,
                     stage: str, model: str = None, timeout: int = 180) -> dict:
-    """Call the local OpenAI-compatible endpoint and track this LLM call."""
+    """Call whichever local OpenAI-compatible server hosts `model` and
+    track this LLM call."""
     model = model or config.LM_STUDIO_MODEL
+    base_url = _base_url_for(model)
     start = time.perf_counter()
     response = requests.post(
-        f"{config.LM_STUDIO_BASE_URL}/chat/completions",
+        f"{base_url}/chat/completions",
         json={
             "model": model,
             "messages": messages,
@@ -78,8 +94,8 @@ def call_completion(messages: list, max_tokens: int, temperature: float,
     if not response.ok:
         detail = response.text.strip()
         raise RuntimeError(
-            f"LM Studio rejected the {stage} request with HTTP {response.status_code} "
-            f"for model {model!r}. Server response: {detail[:1000]}"
+            f"The server at {base_url} rejected the {stage} request with HTTP "
+            f"{response.status_code} for model {model!r}. Server response: {detail[:1000]}"
         )
     data = response.json()
     content = data["choices"][0]["message"]["content"].strip()
@@ -230,8 +246,10 @@ def call_llm(prompt: str, arabic: bool, system_message: str = None,
 
 def connection_error_message() -> str:
     return (
-        "Couldn't reach LM Studio's local server. Make sure LM Studio is "
-        "open, the model configured in config.LM_STUDIO_MODEL is loaded, "
-        "and the Local Server is started (Developer / Local Server tab -> "
-        "Start Server)."
+        "Couldn't reach a local model server. This pipeline can call more than "
+        "one: make sure LM Studio is open with config.LM_STUDIO_MODEL loaded and "
+        "its Local Server started (Developer tab -> Start Server) for "
+        "generation, AND, if config.ROUTER_MODEL/config.JUDGE_MODEL are mapped "
+        "to Ollama in config.MODEL_BASE_URLS, that `ollama serve` is running and "
+        "those models have been pulled (`ollama pull <model>`)."
     )
