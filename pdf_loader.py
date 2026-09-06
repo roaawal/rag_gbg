@@ -66,7 +66,7 @@ def extract_pages(pdf_path: str):
             if text and text.strip():
                 yield i + 1, text
     finally:
-        doc.close()
+        doc.close()#(page_number, page_text)
 
 
 def strip_repeated_boilerplate(records: list, min_repeat_ratio: float = None) -> list:

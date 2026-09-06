@@ -1,25 +1,28 @@
 """
 Routes a question BEFORE any retrieval happens.
 
-Output shape (always):
-    {"route": "simple_llm_direct" | "rag" | "advanced_rag",
-     "reason": "...",
-     "techniques": ["..."]}
+Output shape (always -- a fully validated, machine-readable decision):
+    {
+      "complexity": "simple" | "complex",
+      "requires_documents": bool,
+      "multiple_information_needs": bool,
+      "multiple_search_perspectives": bool,
+      "has_metadata_constraints": bool,
+      "is_vague_or_conversational": bool,
+      "route": "direct" | "rag" | "advanced_rag",
+      "techniques": [...],
+      "reason": "...",
+    }
 
-`techniques` is only meaningful for route == "advanced_rag": it contains
-the optional query-understanding techniques selected for this question.
-Advanced RAG always adds reranking, contextual_compression, and crag at
-execution time; the router does not need to select those stages.
-
-Classification considers (per the task spec):
-  - simple vs. complex wording
-  - whether it needs the indexed documents at all
-  - whether it bundles multiple distinct information needs
-  - whether it would benefit from multiple search phrasings/angles
-  - whether it carries a metadata constraint (a specific section, page,
-    source file, date range, etc.)
-  - whether the wording is vague/conversational and needs disambiguation
-    before it's even a well-formed search query
+`techniques` is only meaningful for route == "advanced_rag" and may only
+contain the four query-UNDERSTANDING techniques the router actively
+selects: "rewriting", "multi_query", "decomposition", "hyde".
+`has_metadata_constraints` is intentionally NOT one of those four -- it
+isn't a phrasing choice, it's a metadata filter, so advanced_rag.py acts
+on that boolean directly (via query_transform.self_query()) regardless
+of which of the four techniques were also picked. Advanced RAG always
+adds reranking, contextual_compression, and crag at execution time; the
+router does not need to select those stages.
 
 The LLM is the primary classifier (it's the only thing that can actually
 read intent), but a small local model won't always return clean JSON, so
@@ -35,33 +38,34 @@ import requests
 import config
 import generation
 
-_ROUTER_SYSTEM_PROMPT = """You are a routing classifier for a document question-answering system over an Arabic bank internal-procedures manual. For each user question, decide which of three routes it needs, considering:
+_ROUTER_SYSTEM_PROMPT = """You are a routing classifier for a document question-answering system over an Arabic bank internal-procedures manual. For each user question, classify it along these dimensions:
 
-- Is the question simple (a quick fact/definition/greeting) or complex (multi-part, needs reasoning)?
-- Does answering it require information from the indexed procedure documents at all, or is it general/conversational (e.g. greetings, small talk, asking about your own capabilities, general knowledge unrelated to the bank's procedures)?
-- Does it bundle MULTIPLE distinct information needs (e.g. "what is the annual inventory procedure AND who approves asset write-offs")?
-- Would it benefit from searching with several different phrasings/angles because the wording is abstract or could be described several ways?
-- Does it carry a METADATA constraint -- a specific section name, page number, source document, or date/version -- that should narrow the search rather than just being extra keywords?
-- Is the wording vague, conversational, or dependent on unstated context (e.g. "what about the second one", "and if it's damaged?") such that it needs to be rewritten into a clear standalone query before searching?
+- complexity: "simple" (a quick fact/definition/greeting) or "complex" (multi-part, needs reasoning)?
+- requires_documents: does answering it require information from the indexed procedure documents at all, or is it general/conversational (e.g. greetings, small talk, asking about your own capabilities, general knowledge unrelated to the bank's procedures)?
+- multiple_information_needs: does it bundle MULTIPLE distinct information needs (e.g. "what is the annual inventory procedure AND who approves asset write-offs")?
+- multiple_search_perspectives: would it benefit from searching with several different phrasings/angles because the wording is abstract or could be described several ways?
+- has_metadata_constraints: does it carry a METADATA constraint -- a specific section name, page number, source document, department, year/date/version -- that should narrow the search rather than just being extra keywords?
+- is_vague_or_conversational: is the wording vague, conversational, or dependent on unstated context (e.g. "what about the second one", "and if it's damaged?") such that it needs to be rewritten into a clear standalone query before searching?
 
-Routes:
-- "simple_llm_direct": no document retrieval needed at all (greetings, meta questions about the assistant, general knowledge unrelated to the manual, or a question already fully answered earlier in this exchange).
-- "rag": needs the documents, but is a single, clear, well-formed, single-need question with no metadata constraint and no ambiguity -- plain hybrid retrieval + generation is enough.
-- "advanced_rag": needs the documents AND has at least one complicating property above (multi-part, vague, needs multiple phrasings, has a metadata constraint, etc.) that plain retrieval would likely handle poorly.
+Then decide the route:
+- "direct": requires_documents is false (greetings, meta questions about the assistant, general knowledge unrelated to the manual, or a question already fully answered earlier in this exchange).
+- "rag": requires_documents is true, but it is a single, clear, well-formed, single-need question with no metadata constraint and no ambiguity -- plain hybrid retrieval + generation is enough.
+- "advanced_rag": requires_documents is true AND at least one of multiple_information_needs / multiple_search_perspectives / has_metadata_constraints / is_vague_or_conversational is true -- plain retrieval would likely handle it poorly.
 
-If route is "advanced_rag", choose the SMALLEST set of techniques from this fixed list that actually addresses what's complicating this specific question -- do not include a technique "just in case":
-- "rewriting": the wording is vague/conversational and needs to become a clear standalone query first.
-- "multi_query": the question is abstract/could be phrased several different ways, and search recall would benefit from trying a few phrasings.
-- "decomposition": the question bundles multiple distinct information needs that should be searched (and answered) somewhat separately.
-- "hyde": the question is conceptual/asks "why" or "how does X work" in a way where a hypothetical answer passage would embed closer to the real answer than the bare question would.
-- "self_query": the question names a specific section, page, source document, or date/version that should become a metadata filter.
-If route is "rag" or "simple_llm_direct", techniques MUST be an empty list.
+If route is "advanced_rag", choose the SMALLEST set of techniques from this fixed list that actually addresses what's complicating this specific question -- do not include a technique "just in case", and do not include a technique the boolean flags above don't support:
+- "rewriting": use when is_vague_or_conversational is true.
+- "multi_query": use when multiple_search_perspectives is true.
+- "decomposition": use when multiple_information_needs is true.
+- "hyde": use when the question is conceptual/asks "why" or "how does X work" in a way where a hypothetical answer passage would embed closer to the real answer than the bare question would.
+Do NOT put "self_query" in techniques -- metadata filtering is handled automatically from has_metadata_constraints, it is not a technique you select.
+If route is "rag" or "direct", techniques MUST be an empty list.
 
-Respond with ONLY a single JSON object, no markdown fences, no extra text.
-The value of "route" must be exactly ONE of these three strings: "simple_llm_direct", "rag", or "advanced_rag". Do not copy the pipe-separated list into the value.
+Respond with ONLY a single JSON object, no markdown fences, no extra text, matching exactly this shape:
+{"complexity": "simple|complex", "requires_documents": true|false, "multiple_information_needs": true|false, "multiple_search_perspectives": true|false, "has_metadata_constraints": true|false, "is_vague_or_conversational": true|false, "route": "direct|rag|advanced_rag", "techniques": [], "reason": "one short sentence"}
+The value of "route" must be exactly ONE of: "direct", "rag", "advanced_rag" -- do not copy the pipe-separated placeholder into the value.
 The "reason" value is required and must be one short, non-empty sentence explaining the route choice.
-Example format (choose one real route, do not output the placeholders):
-{"route": "rag", "reason": "The question needs one document search.", "techniques": []}
+Example (a real decision, not the placeholders above):
+{"complexity": "complex", "requires_documents": true, "multiple_information_needs": true, "multiple_search_perspectives": true, "has_metadata_constraints": false, "is_vague_or_conversational": false, "route": "advanced_rag", "techniques": ["decomposition", "multi_query"], "reason": "Multiple information needs require decomposition and multiple retrieval perspectives."}
 """
 
 
@@ -79,7 +83,7 @@ def _heuristic_classify(question: str, fallback_reason: str = None) -> dict:
     (connection error) or returns something unparseable. Deliberately
     simple and conservative -- it leans toward "rag" (safe middle ground)
     rather than guessing at advanced techniques it can't justify from a
-    quick heuristic.
+    quick heuristic. Always returns the full validated decision shape.
     """
     q = question.strip()
     q_lower = q.lower()
@@ -87,22 +91,32 @@ def _heuristic_classify(question: str, fallback_reason: str = None) -> dict:
     if fallback_reason:
         fallback_prefix += f" ({fallback_reason})"
 
+    def _decision(**overrides):
+        base = {
+            "complexity": "simple",
+            "requires_documents": False,
+            "multiple_information_needs": False,
+            "multiple_search_perspectives": False,
+            "has_metadata_constraints": False,
+            "is_vague_or_conversational": False,
+            "route": "direct",
+            "techniques": [],
+            "reason": fallback_prefix,
+        }
+        base.update(overrides)
+        return base
+
     greeting_markers = ["hello", "hi ", "hey", "thanks", "thank you", "مرحبا", "شكرا", "أهلا", "السلام عليكم"]
     if len(q) < 25 and any(m in q_lower for m in greeting_markers):
-        return {
-            "route": "simple_llm_direct",
-            "reason": f"{fallback_prefix}: short greeting/small-talk pattern, no document need detected.",
-            "techniques": [],
-        }
+        return _decision(
+            reason=f"{fallback_prefix}: short greeting/small-talk pattern, no document need detected.",
+        )
 
     if not q.endswith("?") and not q.endswith("؟") and len(q.split()) < 4:
-        return {
-            "route": "simple_llm_direct",
-            "reason": f"{fallback_prefix}: very short, non-question fragment.",
-            "techniques": [],
-        }
+        return _decision(
+            reason=f"{fallback_prefix}: very short, non-question fragment.",
+        )
 
-    techniques = []
     metadata_markers = ["page", "صفحة", "section", "قسم", "الجزء", ".pdf", "version", "إصدار"]
     has_metadata = any(m in q_lower for m in metadata_markers)
     tokens = re.findall(r"[\w’']+", q_lower, re.UNICODE)
@@ -118,23 +132,29 @@ def _heuristic_classify(question: str, fallback_reason: str = None) -> dict:
     has_multi_need = interrogative_count >= 2
     is_long = len(q.split()) > 25
 
-    if has_metadata:
-        techniques.append("self_query")
-    if has_multi_need or is_long:
+    techniques = []
+    if has_multi_need:
         techniques.append("decomposition")
+    if is_long and "decomposition" not in techniques:
+        techniques.append("multi_query")
 
-    if techniques:
-        return {
-            "route": "advanced_rag",
-            "reason": f"{fallback_prefix}: detected multi-part wording and/or a metadata-like reference.",
-            "techniques": techniques,
-        }
+    if has_metadata or techniques:
+        return _decision(
+            complexity="complex" if (has_multi_need or is_long) else "simple",
+            requires_documents=True,
+            multiple_information_needs=has_multi_need,
+            multiple_search_perspectives=is_long,
+            has_metadata_constraints=has_metadata,
+            route="advanced_rag",
+            techniques=techniques,
+            reason=f"{fallback_prefix}: detected multi-part wording and/or a metadata-like reference.",
+        )
 
-    return {
-        "route": "rag",
-        "reason": f"{fallback_prefix}: looks like a single clear document question.",
-        "techniques": [],
-    }
+    return _decision(
+        requires_documents=True,
+        route="rag",
+        reason=f"{fallback_prefix}: looks like a single clear document question.",
+    )
 
 
 def _looks_document_related(question: str) -> bool:
@@ -164,6 +184,19 @@ def _validate(decision: dict, question: str) -> dict:
     if route not in config.VALID_ROUTES:
         return _heuristic_classify(question, f"invalid route {route!r}")
 
+    def _bool(key):
+        return bool(decision.get(key))
+
+    complexity = decision.get("complexity")
+    if complexity not in config.VALID_COMPLEXITY:
+        complexity = "complex" if route == "advanced_rag" else "simple"
+
+    requires_documents = _bool("requires_documents") or route in {"rag", "advanced_rag"}
+    multiple_information_needs = _bool("multiple_information_needs")
+    multiple_search_perspectives = _bool("multiple_search_perspectives")
+    has_metadata_constraints = _bool("has_metadata_constraints")
+    is_vague_or_conversational = _bool("is_vague_or_conversational")
+
     techniques = decision.get("techniques") or []
     if not isinstance(techniques, list):
         techniques = []
@@ -173,37 +206,70 @@ def _validate(decision: dict, question: str) -> dict:
         if isinstance(technique, str) and technique in config.VALID_TECHNIQUES
     ]
 
+    # Consistency check: a technique is only allowed to survive if the
+    # boolean flag that's supposed to justify it actually says so. Small
+    # local models (esp. at temperature 0 with a single detailed few-shot
+    # example in the prompt) can regress toward reproducing that example
+    # -- echoing its `reason` text and technique choice -- rather than
+    # reasoning about the actual question, even while getting their own
+    # boolean flags right. Cross-checking against the flags here catches
+    # that mismatch in code, independent of anything the model's `reason`
+    # string claims.
+    dropped_for_inconsistency = []
+    if "decomposition" in techniques and not multiple_information_needs:
+        techniques.remove("decomposition")
+        dropped_for_inconsistency.append("decomposition (multiple_information_needs=False)")
+    if "multi_query" in techniques and not multiple_search_perspectives:
+        techniques.remove("multi_query")
+        dropped_for_inconsistency.append("multi_query (multiple_search_perspectives=False)")
+    if "rewriting" in techniques and not is_vague_or_conversational:
+        techniques.remove("rewriting")
+        dropped_for_inconsistency.append("rewriting (is_vague_or_conversational=False)")
+
     if route != "advanced_rag":
         techniques = []
-    elif not techniques:
-        # advanced_rag was chosen but nothing survived validation -- fall
-        # back to plain rag rather than running an "advanced" pipeline
-        # with zero actual advanced techniques.
+    elif not techniques and not has_metadata_constraints:
+        # advanced_rag was chosen but nothing survived validation and
+        # there's no metadata constraint to act on either -- fall back to
+        # plain rag rather than running an "advanced" pipeline that
+        # would do nothing differently from it.
         route = "rag"
 
     reason = decision.get("reason")
     if not isinstance(reason, str) or not reason.strip():
-        reason = (
-            f"Router model omitted a reason; using the validated {route!r} route."
+        reason = f"Router model omitted a reason; using the validated {route!r} route."
+    reason = reason.strip()
+    if dropped_for_inconsistency:
+        reason += (
+            " [Corrected: dropped inconsistent technique(s) the model's own flags didn't "
+            f"support: {', '.join(dropped_for_inconsistency)}.]"
         )
 
-    if route == "simple_llm_direct" and _looks_document_related(question):
-        return {
-            "route": "rag",
-            "reason": (
-                f"{reason.strip()} Overridden: document-related terms were detected, "
-                "so the indexed manual must be searched."
-            ),
-            "techniques": [],
-        }
+    if route == "direct" and _looks_document_related(question):
+        route = "rag"
+        requires_documents = True
+        reason = (
+            f"{reason} Overridden: document-related terms were detected, "
+            "so the indexed manual must be searched."
+        )
 
-    return {"route": route, "reason": reason.strip(), "techniques": techniques}
+    return {
+        "complexity": complexity,
+        "requires_documents": requires_documents,
+        "multiple_information_needs": multiple_information_needs,
+        "multiple_search_perspectives": multiple_search_perspectives,
+        "has_metadata_constraints": has_metadata_constraints,
+        "is_vague_or_conversational": is_vague_or_conversational,
+        "route": route,
+        "techniques": techniques,
+        "reason": reason,
+    }
 
 
 def classify_route(question: str) -> dict:
     """
-    The main entry point. Always returns a valid
-    {"route", "reason", "techniques"} dict -- never raises, falling back
+    The main entry point. Always returns a valid, fully-populated
+    decision dict (see module docstring) -- never raises, falling back
     to _heuristic_classify() on any LLM/parse failure.
     """
     raw_text = ""

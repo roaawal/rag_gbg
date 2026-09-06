@@ -1,8 +1,12 @@
 """
 Query understanding & transformation techniques for the advanced_rag
 route. Each function does ONE technique and is meant to be called only
-when router.classify_route() actually selected it -- advanced_rag.py is
-the only caller, and it skips whatever wasn't selected.
+when the router actually selected it (rewrite_query/multi_query/
+decompose_query/hyde_answer -- gated on router.classify_route()'s
+`techniques` list) or, for self_query, when the router's
+`has_metadata_constraints` flag is set (self_query is a metadata filter,
+not one of the four selectable techniques). advanced_rag.py is the only
+caller, and it skips whatever wasn't selected/flagged.
 """
 import json
 import re
@@ -14,7 +18,8 @@ import generation
 import rag
 
 
-def _call_json_llm(system_prompt: str, user_prompt: str, max_tokens: int, fallback, stage: str):
+def _call_json_llm(system_prompt: str, user_prompt: str, max_tokens: int, fallback, stage: str,
+                    model: str = None):
     """Shared helper: call the LLM expecting JSON back, fall back to
     `fallback` (a plain value, not a callable) on any failure so a
     technique degrading gracefully never breaks the whole pipeline."""
@@ -27,6 +32,7 @@ def _call_json_llm(system_prompt: str, user_prompt: str, max_tokens: int, fallba
             max_tokens=max_tokens,
             temperature=0.3,
             stage=stage,
+            model=model,
             timeout=60,
         )
         raw = result["text"]
@@ -67,6 +73,7 @@ def rewrite_query(question: str) -> str:
             max_tokens=150,
             temperature=0.2,
             stage="rewriter",
+            model=config.REWRITER_MODEL,
             timeout=60,
         )
         rewritten = result["text"]
@@ -95,7 +102,8 @@ def multi_query(question: str, n: int = None) -> list:
         f"angles, synonyms, or specificity) to broaden search recall, in the same "
         f"language. Return ONLY a JSON array of strings, no explanation."
     )
-    result = _call_json_llm(system, question, max_tokens=300, fallback=[question], stage="multi_query")
+    result = _call_json_llm(system, question, max_tokens=300, fallback=[question], stage="multi_query",
+                             model=config.MULTI_QUERY_MODEL)
     if isinstance(result, list) and result:
         variants = [str(v).strip() for v in result if str(v).strip()]
         if question not in variants:
@@ -127,7 +135,8 @@ def decompose_query(question: str, max_subqs: int = None) -> list:
         f"need. If the question already covers a single need, return it unchanged, "
         f"un-split. Return ONLY a JSON array of strings, no explanation."
     )
-    result = _call_json_llm(system, question, max_tokens=300, fallback=[question], stage="decomposition")
+    result = _call_json_llm(system, question, max_tokens=300, fallback=[question], stage="decomposition",
+                             model=config.DECOMPOSITION_MODEL)
     if isinstance(result, list) and result:
         subqs = [str(v).strip() for v in result if str(v).strip()]
         return subqs[:max_subqs] if subqs else [question]
@@ -166,6 +175,7 @@ def hyde_answer(question: str) -> str:
             max_tokens=config.HYDE_MAX_NEW_TOKENS,
             temperature=0.4,
             stage="hyde",
+            model=config.HYDE_MODEL,
             timeout=60,
         )
         passage = result["text"]
