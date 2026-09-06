@@ -6,14 +6,10 @@ Output shape (always):
      "reason": "...",
      "techniques": ["..."]}
 
-`techniques` is only meaningful for route == "advanced_rag": it's the
-SUBSET of {rewriting, multi_query, decomposition, hyde, self_query,
-reranking, contextual_compression, crag} this specific question actually
-needs. The router is deliberately asked to pick as few as fit -- forcing
-every question through every technique wastes latency/cost and, for
-things like decomposition or HyDE, can actively hurt a question that
-didn't need them (e.g. decomposing an already-atomic question invents
-sub-questions that weren't asked).
+`techniques` is only meaningful for route == "advanced_rag": it contains
+the optional query-understanding techniques selected for this question.
+Advanced RAG always adds reranking, contextual_compression, and crag at
+execution time; the router does not need to select those stages.
 
 Classification considers (per the task spec):
   - simple vs. complex wording
@@ -59,10 +55,6 @@ If route is "advanced_rag", choose the SMALLEST set of techniques from this fixe
 - "decomposition": the question bundles multiple distinct information needs that should be searched (and answered) somewhat separately.
 - "hyde": the question is conceptual/asks "why" or "how does X work" in a way where a hypothetical answer passage would embed closer to the real answer than the bare question would.
 - "self_query": the question names a specific section, page, source document, or date/version that should become a metadata filter.
-- "reranking": the question is broad or ambiguous enough that initial hybrid retrieval is likely to surface some irrelevant chunks worth re-scoring.
-- "contextual_compression": likely to retrieve chunks that are only partially relevant (long chunks with mixed content) where trimming to the relevant sentences would sharpen the final answer.
-- "crag": there's real risk the corpus doesn't actually cover this question well and the system should double-check retrieval quality and self-correct rather than confidently answering from weak context.
-
 If route is "rag" or "simple_llm_direct", techniques MUST be an empty list.
 
 Respond with ONLY a single JSON object, no markdown fences, no extra text.

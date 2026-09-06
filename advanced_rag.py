@@ -1,8 +1,8 @@
 """
 Advanced RAG orchestration.
 
-Applies ONLY the techniques listed in the router's decision -- never all
-eight. Order of operations (skipping whatever wasn't selected):
+Applies the selected query-understanding techniques, then always runs
+reranking, contextual compression, and CRAG. Order of operations:
 
   1. self_query      -> metadata filter + cleaned question
   2. rewriting        -> cleaned question, disambiguated
@@ -12,16 +12,16 @@ eight. Order of operations (skipping whatever wasn't selected):
      multi_query is about phrasing the SAME need several ways)
   4. hyde              -> one extra hypothetical-passage query added to
      the search-query list
-  5. hybrid retrieval, once per search query, fused across queries via RRF
-  6. reranking          -> keep the LLM-rescored top few
-  7. contextual_compression -> trim each surviving chunk to relevant sentences
-  8. crag               -> grade retrieval quality, one corrective
+    5. hybrid retrieval, once per search query, fused across queries via RRF
+    6. reranking          -> keep the LLM-rescored top few
+    7. crag               -> grade retrieval quality, one corrective
      re-retrieval attempt if graded ambiguous/incorrect
+    8. contextual_compression -> trim the final chunks to relevant sentences
   9. final grounded generation (generation.py -- same module every route uses)
 
 If none of the five query-understanding techniques were selected, the
-raw question is used as the single search query. If neither reranking
-nor crag were selected, retrieval simply keeps config.TOP_K fused hits.
+raw question is used as the single search query. The three retrieval
+improvement stages above are mandatory for every advanced route.
 """
 import time
 import uuid
@@ -54,15 +54,22 @@ def _multi_query_retrieve(queries: list, where: dict, pool_top_k: int):
 
 def answer_advanced(question: str, techniques: list, top_k: int = None) -> dict:
     """
-    Runs the advanced_rag route for one question, applying only the
-    given `techniques` (as decided by router.classify_route()). Returns
+    Runs the advanced_rag route for one question, applying the selected
+    query-understanding techniques plus the mandatory retrieval-improvement
+    stages. Returns
     the same record schema as rag.answer_question_full()/basic_rag.answer(),
     plus advanced-route-specific fields: techniques_used, search_queries,
     self_query_filter, crag_grade.
     """
     top_k = top_k or config.TOP_K
     total_start = time.perf_counter()
-    techniques = set(techniques)
+    # These stages define the advanced route's retrieval contract. The
+    # router only chooses the optional query-understanding techniques.
+    techniques = set(techniques) | {
+        "reranking",
+        "contextual_compression",
+        "crag",
+    }
 
     # 1. self_query
     where_filter = None
@@ -91,30 +98,20 @@ def answer_advanced(question: str, techniques: list, top_k: int = None) -> dict:
         search_queries = search_queries + [hyde_passage]
 
     # 5. retrieval, fused across every search query
-    retrieval_pool = config.RERANK_CANDIDATE_POOL if "reranking" in techniques else top_k
+    retrieval_pool = config.RERANK_CANDIDATE_POOL
     hits = _multi_query_retrieve(search_queries, where_filter, retrieval_pool)
 
     # 6. reranking
-    if "reranking" in techniques:
-        hits = retrieval_improve.rerank(cleaned_question, hits, keep_top_k=top_k)
-    else:
-        hits = hits[:top_k]
+    hits = retrieval_improve.rerank(cleaned_question, hits, keep_top_k=top_k)
 
-    # 7. contextual compression
-    if "contextual_compression" in techniques:
-        hits = retrieval_improve.contextual_compression(cleaned_question, hits)
-
-    # 8. CRAG
+    # 7. CRAG
     crag_grade = None
     crag_corrected = False
     if "crag" in techniques:
         def _corrective_retrieve():
             wider_pool = retrieval_pool * config.CRAG_CORRECTED_POOL_MULTIPLIER
             corrected = _multi_query_retrieve(search_queries, where_filter, wider_pool)
-            if "reranking" in techniques:
-                corrected = retrieval_improve.rerank(cleaned_question, corrected, keep_top_k=top_k)
-            else:
-                corrected = corrected[:top_k]
+            corrected = retrieval_improve.rerank(cleaned_question, corrected, keep_top_k=top_k)
             return corrected
 
         crag_result = retrieval_improve.crag_evaluate_and_correct(
@@ -123,6 +120,9 @@ def answer_advanced(question: str, techniques: list, top_k: int = None) -> dict:
         hits = crag_result["hits"]
         crag_grade = crag_result["grade"]
         crag_corrected = crag_result["corrected"]
+
+    # 8. Compress after CRAG so corrected hits follow the same final path.
+    hits = retrieval_improve.contextual_compression(cleaned_question, hits)
 
     # 9. final grounded generation -- same shared module every route uses
     context = "\n\n---\n\n".join(h["text"] for h in hits)
