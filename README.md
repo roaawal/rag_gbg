@@ -400,15 +400,6 @@ Check the following in order:
 5. The router selected the correct route.
 6. The model servers are using the intended models.
 
-## Limitations
-
-- The system depends on the quality of the source PDF text.
-- Scanned image-only PDFs require OCR before useful indexing.
-- Local model quality and hardware affect latency and answer quality.
-- LLM-based routing, reranking, compression, and judging are not deterministic ground truth.
-- Historical log records may have been produced with older model configurations.
-- Rebuilding the index replaces the existing Chroma collection.
-- CRAG retries local retrieval only; it does not search the internet.
 
 ## Quick Presentation Summary
 
