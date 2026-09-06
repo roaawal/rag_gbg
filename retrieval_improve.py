@@ -14,7 +14,8 @@ import config
 import generation
 
 
-def _score_llm_json(system_prompt: str, user_prompt: str, max_tokens: int, fallback, stage: str):
+def _score_llm_json(system_prompt: str, user_prompt: str, max_tokens: int, fallback, stage: str,
+                     model: str = None):
     try:
         result = generation.call_completion(
             messages=[
@@ -24,6 +25,7 @@ def _score_llm_json(system_prompt: str, user_prompt: str, max_tokens: int, fallb
             max_tokens=max_tokens,
             temperature=0.0,
             stage=stage,
+            model=model,
             timeout=60,
         )
         raw = result["text"]
@@ -65,7 +67,8 @@ def rerank(question: str, hits: list, keep_top_k: int = None) -> list:
     user_prompt = f"Question: {question}\n\nPassages:\n{passages}"
 
     fallback_scores = {h["id"]: len(candidates) - i for i, h in enumerate(candidates)}
-    scores = _score_llm_json(_RERANK_SYSTEM, user_prompt, max_tokens=300, fallback=fallback_scores, stage="reranking")
+    scores = _score_llm_json(_RERANK_SYSTEM, user_prompt, max_tokens=300, fallback=fallback_scores,
+                              stage="reranking", model=config.RERANKER_MODEL)
     if not isinstance(scores, dict):
         scores = fallback_scores
 
@@ -116,6 +119,7 @@ def contextual_compression(question: str, hits: list) -> list:
                 max_tokens=400,
                 temperature=0.0,
                 stage="contextual_compression",
+                model=config.COMPRESSION_MODEL,
                 timeout=60,
             )
             compressed_text = result["text"]
@@ -148,7 +152,8 @@ def _grade_context(question: str, hits: list) -> dict:
     context_preview = "\n\n".join(h["text"][:400] for h in hits)
     user_prompt = f"Question: {question}\n\nRetrieved context:\n{context_preview}"
     fallback = {"grade": "ambiguous", "reason": "Grading call failed; treating as ambiguous to be safe."}
-    result = _score_llm_json(_CRAG_GRADE_SYSTEM, user_prompt, max_tokens=150, fallback=fallback, stage="crag_evaluator")
+    result = _score_llm_json(_CRAG_GRADE_SYSTEM, user_prompt, max_tokens=150, fallback=fallback,
+                              stage="crag_evaluator", model=config.CRAG_MODEL)
     if not isinstance(result, dict) or result.get("grade") not in {"correct", "ambiguous", "incorrect"}:
         return fallback
     return result

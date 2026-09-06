@@ -1,7 +1,7 @@
 """
 Shared "final LLM call" logic.
 
-Whichever route the router sends a question down (simple_llm_direct, rag,
+Whichever route the router sends a question down (direct, rag,
 or advanced_rag), it ends here: one grounded-answer prompt template, one
 LLM call function. This is deliberate -- the grounding rules (use only
 the supplied context, don't invent facts, say so if the context is
@@ -40,7 +40,7 @@ def stop_call_tracking(token):
 
 
 def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
-                latency_seconds: float):
+                latency_seconds: float, success: bool = True, tokens_estimated: bool = False):
     ledger = _call_ledger.get()
     if ledger is None:
         return
@@ -53,9 +53,13 @@ def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
         "cost": cost,
         "latency_seconds": latency_seconds,
+        "tokens_estimated": tokens_estimated,
+        "success": success,
         "executed": True,
+        "timestamp": time.time(),
     })
 
 
@@ -77,22 +81,31 @@ def call_completion(messages: list, max_tokens: int, temperature: float,
                     stage: str, model: str = None, timeout: int = 180) -> dict:
     """Call whichever local OpenAI-compatible server hosts `model` and
     track this LLM call."""
-    model = model or config.LM_STUDIO_MODEL
+    model = model or config.GENERATION_MODEL
     base_url = _base_url_for(model)
     start = time.perf_counter()
-    response = requests.post(
-        f"{base_url}/chat/completions",
-        json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        },
-        timeout=timeout,
-    )
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException:
+        # Record the failed call (0 tokens, success=False) before letting
+        # the caller's own error handling/fallback take over -- every
+        # attempted LLM call is tracked, whether or not it succeeded.
+        _record_call(stage, model, 0, 0, time.perf_counter() - start, success=False)
+        raise
+
     latency_seconds = time.perf_counter() - start
     if not response.ok:
         detail = response.text.strip()
+        _record_call(stage, model, 0, 0, latency_seconds, success=False)
         raise RuntimeError(
             f"The server at {base_url} rejected the {stage} request with HTTP "
             f"{response.status_code} for model {model!r}. Server response: {detail[:1000]}"
@@ -100,17 +113,22 @@ def call_completion(messages: list, max_tokens: int, temperature: float,
     data = response.json()
     content = data["choices"][0]["message"]["content"].strip()
     usage = data.get("usage") or {}
-    input_tokens = usage.get("prompt_tokens") or estimate_tokens(
+    reported_input = usage.get("prompt_tokens")
+    reported_output = usage.get("completion_tokens")
+    input_tokens = reported_input or estimate_tokens(
         "\n".join(str(m.get("content", "")) for m in messages)
     )
-    output_tokens = usage.get("completion_tokens") or estimate_tokens(content)
-    _record_call(stage, model, input_tokens, output_tokens, latency_seconds)
+    output_tokens = reported_output or estimate_tokens(content)
+    tokens_estimated = not (reported_input and reported_output)
+    _record_call(stage, model, input_tokens, output_tokens, latency_seconds,
+                 success=True, tokens_estimated=tokens_estimated)
     return {
         "data": data,
         "text": content,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "latency_seconds": latency_seconds,
+        "tokens_estimated": tokens_estimated,
     }
 
 
@@ -157,6 +175,8 @@ def build_grounded_prompt(question: str, hits: list) -> str:
 - أجب باللغة العربية الفصحى فقط من أول كلمة إلى آخر كلمة. ممنوع منعًا باتًا استخدام أي كلمة أو حرف باللغة الإنجليزية.
 - تجاهل تمامًا أي معلومات إدارية أو شكلية من رأس أو تذييل الوثيقة (رقم الإصدار، تاريخ الإصدار، "للاستخدام الداخلي").
 - إذا كان المحتوى يصف إجراءً أو خطوات، اذكر كل خطوة مرقّمة بالترتيب، مع التفاصيل المهمة (من المسؤول، ما هي النماذج أو السجلات المطلوبة، التوقيت). لا تلخص في جملة واحدة قصيرة.
+- السياق أدناه هو المقتطفات المسترجعة فعلياً من الوثائق فقط -- لا تعتبر أي إعادة صياغة للسؤال أو فقرة افتراضية أو استعلامات بحث مولّدة دليلاً على الإطلاق.
+- إذا تعارضت المصادر المسترجعة مع بعضها البعض، اذكر هذا التعارض بوضوح في إجابتك بدلاً من اختيار جانب واحد بصمت.
 - في نهاية الإجابة، اذكر معرّف المقتطف/رقم الصفحة المصدر (مثال: المصدر: صفحة 8، Chunk ID: ...)."""
     else:
         instruction = """Using ONLY the context excerpts below, give a complete, detailed \
@@ -168,7 +188,11 @@ def build_grounded_prompt(question: str, hits: list) -> str:
     sentence -- if the context describes a procedure, list every step in order, numbered, with \
     any relevant detail (who does it, what forms/records are involved, timing). Ignore \
     administrative letterhead/boilerplate (issue dates, revision numbers, "Internal Use" labels). \
-    At the end, mention the source chunk id(s) and page number(s) the answer was drawn from."""
+    The context below consists only of passages actually retrieved from the documents -- never \
+    treat a query rewrite, a hypothetical passage, or a generated search query as evidence. If the \
+    retrieved sources disagree with each other, clearly point out the disagreement instead of \
+    silently picking one side. At the end, mention the source chunk id(s) and page number(s) the \
+    answer was drawn from."""
 
     return f"""{instruction}
 
@@ -182,7 +206,7 @@ Detailed answer:"""
 
 def build_direct_prompt(question: str) -> str:
     """
-    The simple_llm_direct route's prompt: no document context at all. Used
+    The "direct" route's prompt: no document context at all. Used
     for genuinely general/conversational questions the router decided
     don't need the corpus. Still answers in the question's language and
     stays honest about not consulting any document.
@@ -199,7 +223,7 @@ def build_direct_prompt(question: str) -> str:
 
 def call_llm(prompt: str, arabic: bool, system_message: str = None,
              max_tokens: int = None, temperature: float = None,
-             stage: str = "final_generation") -> dict:
+             stage: str = "final_generation", model: str = None) -> dict:
     """
     Returns {"text": answer, "input_tokens": int, "output_tokens": int,
     "latency_seconds": float}.
@@ -234,6 +258,7 @@ def call_llm(prompt: str, arabic: bool, system_message: str = None,
         max_tokens=max_tokens or config.MAX_NEW_TOKENS,
         temperature=config.TEMPERATURE if temperature is None else temperature,
         stage=stage,
+        model=model or config.GENERATION_MODEL,
     )
 
     return {

@@ -59,6 +59,16 @@ HEADER_FOOTER_MIN_REPEAT_RATIO = 0.5
 # warning naming the affected source file.
 TEXT_CORRUPTION_WARN_RATIO = 0.3
 
+# Threshold for the SEPARATE mixed-script corruption check (see
+# pdf_loader.estimate_mixed_script_corruption's docstring) -- a different
+# corruption pattern (individual letters silently swapped for foreign-
+# script codepoints, anywhere in the text, including domain nouns) that
+# the function-word probe above can miss entirely. Lower threshold than
+# TEXT_CORRUPTION_WARN_RATIO because even a small fraction of domain
+# nouns getting corrupted this way meaningfully hurts retrieval (unlike
+# the function-word pattern, which mostly hits connective words).
+MIXED_SCRIPT_WARN_RATIO = 0.05
+
 # --- Generation: via LM Studio's local server ---
 # Given this machine's actual hardware (RTX 3050, 4GB VRAM; 16GB system
 # RAM), running a model directly in Python (via transformers or raw
@@ -74,21 +84,23 @@ TEXT_CORRUPTION_WARN_RATIO = 0.3
 # core first-class architectures the way Llama/Qwen/Gemma/Mistral are.
 # GGUF builds of it are community-converted, and mismatches between the
 # GGUF and whatever llama.cpp build LM Studio ships tend to surface as
-# load failures or crashes -- this is an architecture-support problem,
-# not a hardware-size problem (a 2.7B model is tiny for this GPU).
+# load failures or crashes. Jais's context window is also a hard 2,048
+# tokens (the length it was actually trained on), which is what caused
+# the "request (6100 tokens) exceeds the available context size (2048
+# tokens)" HTTP 400 -- a handful of retrieved chunks plus the grounding
+# instructions routinely blew past that.
 #
-# Qwen2.5-Instruct is a mainstream, well-supported architecture with
-# strong Arabic capability in practice, and was tried as an alternative
-# to Jais here (see the note above about Jais's non-standard ALiBi
-# architecture and llama.cpp/GGUF compatibility risk). Kept as a
-# commented fallback in case Jais gives you trouble again -- if it
-# crashes, this is the first thing to switch to.
+# Switched generation to Qwen2.5-3B-Instruct
+# (lmstudio-community/Qwen2.5-3B-Instruct-GGUF): mainstream/well-
+# supported architecture, strong Arabic capability in practice, and a
+# 32k context window -- more than enough headroom for this pipeline's
+# prompts that no pre-flight token budgeting/trimming is needed.
 LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
-LM_STUDIO_MODEL = "jais-family-2p7b-chat"  # main answer-generation model
+LM_STUDIO_MODEL = "qwen2.5-3b-instruct"  # main answer-generation model -- lmstudio-community/Qwen2.5-3B-Instruct-GGUF, 32k context
 # If you want the router and judge to use different models than the
 # answer-generation model, load those model names in LM Studio and set
 # the values below to match exactly.
-# LM_STUDIO_MODEL = "qwen2.5-3b-instruct"      # alternate generation model
+# LM_STUDIO_MODEL = "jais-family-2p7b-chat"    # Arabic-native alternative -- NOTE: hard 2,048-token context, see above
 # LM_STUDIO_MODEL = "qwen2.5-7b-instruct"      # heavier generation model
 
 # --- Ollama (used for router + judge, since only Jais is loaded in LM
@@ -114,6 +126,25 @@ MODEL_BASE_URLS = {
 
 MAX_NEW_TOKENS = 800
 TEMPERATURE = 0.2
+
+# --- Per-stage model configuration ---
+# Every LLM-driven stage of the pipeline gets its OWN configured model
+# name instead of hardcoding one everywhere. All of them default to
+# LM_STUDIO_MODEL (the only model actually loaded in LM Studio in the
+# current single-GPU setup), so existing behavior is unchanged out of
+# the box -- but each can be pointed at a different model (e.g. one of
+# the Ollama-hosted Qwen models, or a future dedicated reranker/judge
+# model) independently, and generation.call_completion() already knows
+# how to route any model name to the right server via
+# config.MODEL_BASE_URLS.
+GENERATION_MODEL = LM_STUDIO_MODEL      # final grounded/direct answer
+REWRITER_MODEL = LM_STUDIO_MODEL        # query rewriting
+MULTI_QUERY_MODEL = LM_STUDIO_MODEL     # multi-query generation
+DECOMPOSITION_MODEL = LM_STUDIO_MODEL   # question decomposition
+HYDE_MODEL = LM_STUDIO_MODEL            # hypothetical-document generation
+RERANKER_MODEL = LM_STUDIO_MODEL        # LLM-based reranking
+COMPRESSION_MODEL = LM_STUDIO_MODEL     # contextual compression
+CRAG_MODEL = LM_STUDIO_MODEL            # CRAG relevance grading
 
 # --- Cost tracking ---
 # Running fully locally via LM Studio costs $0 per token -- these are 0
@@ -143,11 +174,18 @@ JUDGE_TEMPERATURE = 0.0  # deterministic scoring, not creative generation
 ROUTER_MODEL = "qwen2.5:3b"
 ROUTER_MAX_NEW_TOKENS = 300
 ROUTER_TEMPERATURE = 0.0
-VALID_ROUTES = {"simple_llm_direct", "rag", "advanced_rag"}
-VALID_TECHNIQUES = {
-    "rewriting", "multi_query", "decomposition", "hyde", "self_query",
-    "reranking", "contextual_compression", "crag",
-}
+VALID_ROUTES = {"direct", "rag", "advanced_rag"}
+# The router only ever SELECTS from these four query-understanding
+# techniques. self_query is intentionally not in this list: it isn't a
+# question of "should we try a different phrasing", it's a metadata
+# filter, so it's driven directly by the router's `has_metadata_constraints`
+# boolean instead (see router.py / advanced_rag.py). reranking,
+# contextual_compression, and crag are mandatory stages of the advanced
+# route, not techniques the router chooses -- they're recorded in
+# MANDATORY_ADVANCED_STAGES for logging/`techniques_used` purposes only.
+VALID_TECHNIQUES = {"rewriting", "multi_query", "decomposition", "hyde"}
+MANDATORY_ADVANCED_STAGES = {"reranking", "contextual_compression", "crag"}
+VALID_COMPLEXITY = {"simple", "complex"}
 
 # --- Advanced RAG: query understanding & transformation ---
 MULTI_QUERY_N = 3            # how many paraphrased query variants to generate

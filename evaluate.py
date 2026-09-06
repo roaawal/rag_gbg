@@ -27,32 +27,34 @@ from logging_utils import append_record, read_records
 
 
 _RUBRIC = """You are a strict evaluator for a document question-answering system.
-Score the given ANSWER on these four metrics, each on a 1-5 integer scale:
+Score the given ANSWER on these four metrics, each on a 0-5 integer scale:
 
-1. context_relevance (1-5): Does the CONTEXT contain information that is
-   actually relevant to answering the QUESTION? 5 = context is squarely
-   on-topic and covers what's needed; 3 = partially relevant, mixed with
-   irrelevant material; 1 = context is unrelated to the question.
+1. context_relevance (0-5): Does the CONTEXT contain information that is
+   actually relevant to answering the QUESTION? 5 = highly relevant,
+   direct evidence for what's needed; 3 = partially relevant, mixed with
+   irrelevant material; 0 = completely irrelevant (or no context at all).
 
-2. faithfulness (1-5): Is every factual claim in the ANSWER actually
+2. faithfulness (0-5): Is every important claim in the ANSWER actually
    supported by the CONTEXT (no hallucination, no outside knowledge)?
-   5 = fully grounded, nothing invented; 3 = mostly grounded but some
-   unsupported claims or extrapolation; 1 = answer contradicts or
-   fabricates content not present in the context.
+   5 = all important claims clearly supported; 3 = mostly grounded but
+   some unsupported claims or extrapolation; 0 = completely unsupported
+   or fabricated.
 
-3. answer_relevance (1-5): Does the ANSWER directly address what the
-   QUESTION actually asked, without padding or going off-topic?
-   5 = fully and directly answers it; 3 = partially answers or includes
-   significant irrelevant content; 1 = does not address the question.
+3. answer_relevance (0-5): Does the ANSWER directly and completely
+   address what the QUESTION actually asked, without padding or going
+   off-topic? 5 = directly and completely answers it; 3 = partially
+   answers or includes significant irrelevant content; 0 = does not
+   address the question at all.
 
-4. correctness (1-5 or null): ONLY if a REFERENCE ANSWER is provided below,
-   compare the ANSWER's key facts against it and score how correct it is.
-   5 = matches the reference's key facts; 3 = partially correct; 1 =
-   contradicts the reference. If no REFERENCE ANSWER is provided, output
-   null for this field -- do not guess a score.
+4. correctness (0-5 or null): ONLY if a REFERENCE ANSWER is provided below,
+   compare the ANSWER's key facts against it. 5 = fully correct, matches
+   the reference's key facts; 3 = partially correct; 0 = completely
+   incorrect/contradicts the reference. If no REFERENCE ANSWER is
+   provided, output null for this field to mark correctness as
+   unavailable -- do not guess a score or pretend it was verified.
 
 Respond with ONLY a single JSON object, no markdown fences, no extra text:
-{"context_relevance": <1-5>, "faithfulness": <1-5>, "answer_relevance": <1-5>, "correctness": <1-5 or null>, "notes": "<one short sentence explaining the weakest score>"}
+{"context_relevance": <0-5>, "faithfulness": <0-5>, "answer_relevance": <0-5>, "correctness": <0-5 or null>, "notes": "<one short sentence explaining the weakest score>"}
 """
 
 
@@ -163,7 +165,7 @@ def evaluate_record(rag_record: dict, reference: str = None, log: bool = True) -
         "judge_notes": judge_notes,
         "judge_model": config.JUDGE_MODEL,
         "judge_latency_seconds": judge_latency,
-        "evaluation_rubric": "fixed_1_to_5_context_faithfulness_relevance_correctness_v1",
+        "evaluation_rubric": "fixed_0_to_5_context_faithfulness_relevance_correctness_v2",
         "reference_available": bool(reference),
     })
 

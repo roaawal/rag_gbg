@@ -3,7 +3,7 @@ Core retrieval logic (hybrid dense + BM25, fused via Reciprocal Rank
 Fusion) plus the plain "rag" route's end-to-end answer function.
 
 Final-answer prompting/LLM-calling now lives in generation.py and is
-shared across every route (simple_llm_direct, rag, advanced_rag) -- see
+shared across every route (direct, rag, advanced_rag) -- see
 that module's docstring. _build_prompt/_generate/_estimate_tokens are
 kept here as thin aliases so existing imports (basic_rag.py) don't break.
 """
@@ -285,6 +285,12 @@ def answer_question_full(question: str, top_k: int = None) -> dict:
         "record_id": str(uuid.uuid4()),
         "approach": "hybrid_rag" if config.USE_HYBRID_RETRIEVAL else "dense_rag",
         "question": question,
+        "executed_steps": ["router", "retrieval", "generation"],
+        "retrieval_stats": {
+            "num_candidates": len(hits),
+            "num_after_reranking": None,
+            "num_after_compression": None,
+        },
         "chunk_ids": [h["id"] for h in hits],
         "retrieved_chunks": [
             {
